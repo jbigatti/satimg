@@ -25,7 +25,8 @@ parameters must match.
 Options:
   -h --help  Show this screen.
   --method=<classification_method>      Classification method to use: random-forest (for random
-                                        forest) or svm (for support vector machines)
+                                        forest), svm (for support vector machines) or
+                                        xgb (for xgboost (eXtreme Gradient Boosting))
                                         [default: random-forest]
   --validation=<validation_data_path>   If given, it must be a path to a directory with vector data
                                         files (in shapefile format). These vectors must specify the
@@ -39,6 +40,8 @@ import numpy as np
 import os
 import pickle
 import sys
+
+import xgboost as xgb
 
 from docopt import docopt
 from osgeo import gdal
@@ -70,8 +73,8 @@ COLORS = [
 ]
 
 
-def create_mask_from_vector(vector_data_path, cols, rows, geo_transform, projection, target_value=1,
-                            output_fname='', dataset_format='MEM'):
+def create_mask_from_vector(vector_data_path, cols, rows, geo_transform, projection,
+                            target_value=1, output_fname='', dataset_format='MEM'):
     """
     Rasterize the given vector (wrapper for gdal.RasterizeLayer). Return a gdal.Dataset.
 
@@ -179,7 +182,6 @@ def report_and_exit(txt, *args, **kwargs):
     sys.exit(1)
 
 
-
 def print_cm(cm, labels):
     """pretty print for confusion matrixes"""
     # https://gist.github.com/ClementC/acf8d5f21fd91c674808
@@ -225,71 +227,86 @@ def test_method(vector_data_path, geo_transform, projection, target_value):
     return target_ds
 
 
-def predict_by_chunks(data, classifier):
+def predict_by_chunks(data, classifier, rows, cols):
     """
     Classify data by chunks.
 
     :param data:        An array of pixels.
     :param classifier:  A trained classifier.
+    :param rows:        Number of rows.
+    :param cols:        Number of cols.
+    :return:            An array with classified data.
     """
 
-    # TODO: Improve this. Could be smarter. Maybe It could resolve how
-    # to split data by itself.
-    new_shape = (4, int(data.shape[0] / 4), 6)
-    flat_pixels_divide = data.reshape(new_shape)
-
     result = np.array([])
-    for i in range(flat_pixels_divide.shape[0]):
-        logger.debug("Classifing [%i/%i]..." % (i, flat_pixels_divide.shape[0] - 1))
-        result = np.concatenate([result, classifier.predict(flat_pixels_divide[i])])
-
+    chunk_size = 100  # Number of rows
+    chunk_nr = 0
+    while chunk_nr * chunk_size < rows:
+        start = chunk_nr * cols * chunk_size
+        end = start + cols * chunk_size
+        chunk = flat_pixels[start: end]
+        predicted_chunk = classifier.predict(chunk)
+        result = np.concatenate([result, predicted_chunk])
+        chunk_nr += 1
     return result
 
-def divide_test_and_training(all_data):
-    rows, cols = all_data.shape
+
+def divide_test_and_training(dataset, for_training):
+    """
+    Split in a randon way a dataset in two, one for test and other for training.
+
+    :param dataset: A numpy array.
+    :for_training:  An integer representating the percentage of data training required.
+    :return:        test array and trainign array.
+    """
+    rows, cols = dataset.shape
     sample = rows * cols
-    # 50% of zeros
-    amount_of_zeros = int((sample * 50) / 100)
-    # 50% of ones
-    amount_of_ones = sample - amount_of_zeros
-    mask = np.array([0] * amount_of_zeros + [1] * amount_of_ones)
-    # We want an array with 50% of 1's and 50% of 0's
+
+    zeros = int((sample * for_training) / 100)
+    ones = sample - zeros
+
+    mask = np.array([0] * zeros + [1] * ones)
+
+    # Randomize
     np.random.shuffle(mask)
-    mask = mask.reshape(all_data.shape)
+    mask = mask.reshape(dataset.shape)
 
-    training = all_data * mask
-
+    training = dataset * mask
     # if mask = [0, 1, 0] ==> ((mask - 1) * (-1)) = [1, 0, 1]
-    test = all_data * ((mask - 1) * (-1))
+    test = dataset * ((mask - 1) * (-1))
 
     return test, training
 
 
-def delete_extra_fields_from_vector(vector_data_path):
+def delete_extra_fields_from_vector(vector_data_path, field):
+    """
+    Delete useless "fields" of a vector.
+
+    :param vector_data_path:    Path to vector file.
+    :fiedls:                    List of fields to delete.
+
+    Beware here, this method modifies the file.
+    """
+
     # Open for update
-    ds = gdal.OpenEx(vector_data_path, gdal.OF_UPDATE )
+    ds = gdal.OpenEx(vector_data_path, gdal.OF_UPDATE)
     if ds is None:
         print("Open failed.")
-        sys.exit( 1 )
+        sys.exit(1)
 
     lyr = ds.GetLayer()
-
-    # Comienza a leer desde el primer feature
-    lyr.ResetReading()
-
     lyr_defn = lyr.GetLayerDefn()
-    # Get field by name
-    field_roi_e_14_1 = lyr_defn.GetFieldIndex('ROI_E_14_1')
-    field_area = lyr_defn.GetFieldIndex('Area')
-    field_e_2015 = lyr_defn.GetFieldIndex('E_2015')
 
-    lyr.DeleteField(field_area)
-    lyr.DeleteField(field_e_2015)
+    # Get field by name
+    for field in fiedls:
+        fld = lyr_defn.GetFieldIndex(field)
+        lyr.DeleteField(fld)
+
     # Close vector
     ds = None
 
 
-def translate_strings_to_int(vector_data_path):
+def translate_strings_to_int(vector_data_path, field):
     ds = gdal.OpenEx(vector_data_path, gdal.OF_UPDATE)
     if ds is None:
         print("Open failed.")
@@ -298,10 +315,10 @@ def translate_strings_to_int(vector_data_path):
 
     lyr.ResetReading()
     lyr_defn = lyr.GetLayerDefn()
-    field_roi_e_14_1 = lyr_defn.GetFieldIndex('ROI_E_14_1')
+    fld = lyr_defn.GetFieldIndex(field)
     for feat in lyr:
-        field_key = feat.GetField(field_roi_e_14_1)
-        feat.SetField(field_roi_e_14_1, TRANSLATE_DICT[field_key])
+        field_key = feat.GetField(fld)
+        feat.SetField(fld, TRANSLATE_DICT[field_key])
         lyr.SetFeature(feat)
     ds = None
 # ###############################################
@@ -337,8 +354,8 @@ if __name__ == "__main__":
 
     bands_data = np.dstack(bands_data)
     rows, cols, n_bands = bands_data.shape
-    # A sample is a vector with all the bands data. Each pixel (independent of its position) is a
-    # sample.
+    # A sample is a vector with all the bands data. Each pixel (independent of
+    # its position) is a sample.
     n_samples = rows * cols
 
     logger.debug("Process the training data")
@@ -351,70 +368,62 @@ if __name__ == "__main__":
 
     labeled_pixels = vectors_to_raster(shapefiles, rows, cols, geo_transform, proj)
 
-    test_data, training_data = divide_test_and_training(labeled_pixels)
+    # If you want divide, uncomment next line and comment [1] and [2]
+    # verification_pixels, training_data = divide_test_and_training(labeled_pixels, 25)
+    # is_train = np.nonzero(training_data)
 
-    # is_train = np.nonzero(labeled_pixels)
-    is_train = np.nonzero(training_data)
+    # [1]
+    is_train = np.nonzero(labeled_pixels)
+
     training_labels = labeled_pixels[is_train]
     training_samples = bands_data[is_train]
 
     flat_pixels = bands_data.reshape((n_samples, n_bands))
 
-    # min_label_value = int(labeled_pixels.min())
-    # max_label_value = int(labeled_pixels.max())
-    # pixels_per_class = {}
-
-    # # Collect some useful data
-    # for label in range(min_label_value, max_label_value + 1):
-    #     key = label
-    #     if label >= 1 and label <= len(classes):
-    #         # We want the "filename" as key.
-    #         key = classes[label - 1]
-    #     pixels_per_class[key] = labeled_pixels[labeled_pixels == label].shape[0]
-
     #
     # Perform classification
     #
+
+    # for xgb
+    param = {}
+    # use softmax multi-class classification
+    param['objective'] = 'multi:softmax'
+    # scale weight of positive examples
+    param['eta'] = 0.1
+    param['silent'] = 1
+    param['nthread'] = 3
+    param['num_class'] = 9
+    num_round = 5
     CLASSIFIERS = {
         # http://scikit-learn.org/dev/modules/generated/sklearn.ensemble.RandomForestClassifier.html
         'random-forest': RandomForestClassifier(n_jobs=4, n_estimators=10, class_weight='balanced'),
         # http://scikit-learn.org/stable/modules/generated/sklearn.svm.SVC.html
-        'svm': SVC(class_weight='balanced')
+        'svm': SVC(class_weight='balanced'),
+        # https://github.com/dmlc/xgboost
+        'xgb': xgb.Booster(params=param)
     }
 
     classifier = CLASSIFIERS[method]
     logger.debug("Train the classifier: %s", str(classifier))
-    classifier.fit(training_samples, training_labels)
 
-    # logger.debug("Saving trained object and some extra information...")
-    # pixel_data = {}
-    # pixel_data['pixel_to_classify'] = flat_pixels
-    # pixel_data['cols'] = cols
-    # pixel_data['rows'] = rows
-    # with open('classifier_trained.pickle', 'wb') as fclass:
-    #     with open('pixels_data.pickle', 'wb') as fpixels:
-    #         pickle.dump(classifier, fclass)
-    #         pickle.dump(pixel_data, fpixels)
+    logger.debug("Train the classifier...")
+    if method == 'xgb':
+        dtrain = xgb.DMatrix(training_samples, label=training_labels)
+        booster = xgb.train(params=param, dtrain=dtrain, num_boost_round=num_round)
+    else:
+        classifier.fit(training_samples, training_labels)
 
-    result = predict_by_chunks(flat_pixels, classifier)
+    logger.debug("Classifing...")
+    if method == 'xgb':
+        dpredict = xgb.DMatrix(flat_pixels)
+        result = booster.predict(dpredict)
+    else:
+        result = predict_by_chunks(flat_pixels, classifier, rows, cols)
 
     # Reshape the result: split the labeled pixels into rows to create an image
     classification = result.reshape((rows, cols))
     write_geotiff(output_fname, classification, geo_transform, proj)
     logger.info("Classification created: %s", output_fname)
-
-    for_verification = np.nonzero(test_data)
-    verification_labels = labeled_pixels[for_verification]
-    predicted_labels = classification[for_verification]
-
-    logger.info("Confussion matrix:\n")
-    print_cm(metrics.confusion_matrix(verification_labels, predicted_labels), classes)
-    target_names = ['Class %s' % s for s in classes]
-    logger.info("Classification report:\n%s",
-                metrics.classification_report(verification_labels, predicted_labels,
-                                              target_names=target_names))
-    logger.info("Classification accuracy: %f",
-                metrics.accuracy_score(verification_labels, predicted_labels))
 
     #
     # Validate the results
@@ -426,13 +435,16 @@ if __name__ == "__main__":
         except OSError.FileNotFoundError as e:
             report_and_exit(str(e))
 
+        # [2]
         verification_pixels = vectors_to_raster(shapefiles, rows, cols, geo_transform, proj)
+
         for_verification = np.nonzero(verification_pixels)
         verification_labels = verification_pixels[for_verification]
         predicted_labels = classification[for_verification]
 
-        logger.info("Confussion matrix:\n%s", str(
-            metrics.confusion_matrix(verification_labels, predicted_labels)))
+        logger.info("Confussion matrix:\n")
+        short_names = [(x.split('_')[0])[:3] for x in clasess]
+        print_cm(metrics.confusion_matrix(verification_labels, predicted_labels), short_names)
         target_names = ['Class %s' % s for s in classes]
         logger.info("Classification report:\n%s",
                     metrics.classification_report(verification_labels, predicted_labels,
